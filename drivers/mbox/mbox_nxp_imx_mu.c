@@ -151,20 +151,19 @@ static DEVICE_API(mbox, nxp_imx_mu_driver_api) = {
 	.set_enabled = nxp_imx_mu_set_enabled,
 };
 
-static void handle_irq(const struct device *dev);
+static void mu_isr(const struct device *dev);
 
 #define MU_INSTANCE_DEFINE(idx)                                                                    \
 	static struct nxp_imx_mu_data nxp_imx_mu_##idx##_data;                                     \
 	const static struct nxp_imx_mu_config nxp_imx_mu_##idx##_config = {                        \
 		.base = (MU_Type *)DT_INST_REG_ADDR(idx),                                          \
 	};                                                                                         \
-	void MU_##idx##_IRQHandler(void);                                                          \
 	static int nxp_imx_mu_##idx##_init(const struct device *dev)                               \
 	{                                                                                          \
 		ARG_UNUSED(dev);                                                                   \
 		MU_Init(nxp_imx_mu_##idx##_config.base);                                           \
-		IRQ_CONNECT(DT_INST_IRQN(idx), DT_INST_IRQ(idx, priority), MU_##idx##_IRQHandler,  \
-			    NULL, 0);                                                              \
+		IRQ_CONNECT(DT_INST_IRQN(idx), DT_INST_IRQ(idx, priority), mu_isr,                 \
+			    DEVICE_DT_INST_GET(idx), 0);                                           \
 		irq_enable(DT_INST_IRQN(idx));                                                     \
 		return 0;                                                                          \
 	}                                                                                          \
@@ -172,28 +171,36 @@ static void handle_irq(const struct device *dev);
 			      &nxp_imx_mu_##idx##_config, PRE_KERNEL_1, CONFIG_MBOX_INIT_PRIORITY, \
 			      &nxp_imx_mu_driver_api)
 
-#define MU_IRQ_HANDLER(idx)                                                                        \
-	void MU_##idx##_IRQHandler(void)                                                           \
-	{                                                                                          \
-		const struct device *dev = DEVICE_DT_INST_GET(idx);                                \
-		handle_irq(dev);                                                                   \
-	}
+DT_INST_FOREACH_STATUS_OKAY(MU_INSTANCE_DEFINE)
 
-#define MU_INST(idx)                                                                               \
-	MU_INSTANCE_DEFINE(idx);                                                                   \
-	MU_IRQ_HANDLER(idx);
-
-DT_INST_FOREACH_STATUS_OKAY(MU_INST)
-
-static void handle_irq(const struct device *dev)
+static void mu_isr(const struct device *dev)
 {
 	struct nxp_imx_mu_data *data = dev->data;
 	const struct nxp_imx_mu_config *config = dev->config;
-	const uint32_t flags = MU_GetStatusFlags(config->base);
+	uint32_t flags = MU_GetStatusFlags(config->base);
 
 	for (int i_channel = 0; i_channel < MU_MAX_CHANNELS; i_channel++) {
-		const uint32_t rx_int_mask = g_rx_flag_mask[i_channel];
+		/* handle notification interrupts first because they are
+		 * more commonly used (for ipc). we want to clear the
+		 * the interrupt ASAP to reduce chance of other side
+		 * trying to send another notification interrupt but
+		 * find the previous one is still pending.
+		 */
 		const uint32_t gen_int_mask = g_gen_int_pend_mask[i_channel];
+
+		if ((flags & gen_int_mask) == gen_int_mask) {
+			MU_ClearStatusFlags(config->base, gen_int_mask);
+			if (data->cb[i_channel]) {
+				data->cb[i_channel](dev, i_channel, data->user_data[i_channel],
+						    NULL);
+			}
+			flags &= ~gen_int_mask;
+			if (flags == 0) {
+				break;
+			}
+		}
+
+		const uint32_t rx_int_mask = g_rx_flag_mask[i_channel];
 
 		if ((flags & rx_int_mask) == rx_int_mask) {
 			data->received_data = MU_ReceiveMsgNonBlocking(config->base, i_channel);
@@ -203,11 +210,9 @@ static void handle_irq(const struct device *dev)
 				data->cb[i_channel](dev, i_channel, data->user_data[i_channel],
 						    &msg);
 			}
-		} else if ((flags & gen_int_mask) == gen_int_mask) {
-			MU_ClearStatusFlags(config->base, gen_int_mask);
-			if (data->cb[i_channel]) {
-				data->cb[i_channel](dev, i_channel, data->user_data[i_channel],
-						    NULL);
+			flags &= ~rx_int_mask;
+			if (flags == 0) {
+				break;
 			}
 		}
 	}
